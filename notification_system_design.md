@@ -429,3 +429,94 @@ db.notifications.deleteOne({
 });
 ```
 
+---
+
+# Stage 3: Query Optimization and Database Tuning
+
+This section answers the performance audit questions regarding query execution, indexing strategies, and database scalability.
+
+---
+
+## 1. Query Analysis & Performance Audit
+
+The developer's original query to fetch unread notifications for a student is:
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### 1.1 Is this query accurate?
+* **Syntactic Correctness**: Yes, the query is syntactically correct SQL.
+* **Accuracy Details**:
+  * **Implicit Type Casting Hazard**: If `studentID` is stored as a string (`VARCHAR`, `UUID`) in the schema, passing a numeric literal (`1042`) forces the database engine to cast the column values to numbers on the fly. This disables index lookups, forcing a full table scan. The query should explicitly pass a string parameter if the schema defines it as such (e.g., `studentID = '1042'`).
+  * **Unnecessary Overhead (`SELECT *`)**: Using `SELECT *` retrieves all columns, including large payload columns (`message`, `metadata`). This consumes significant network bandwidth and prevents the database from performing **Index-Only Scans**.
+  * **Chronological Sorting**: `ORDER BY createdAt ASC` displays notifications from oldest-first. Standard notification feeds show newest-first (`DESC`), though this is acceptable if the application design requires oldest-first queues.
+
+---
+
+## 2. Diagnostics: Why is the query slow?
+
+With **5,000,000 notifications** and **50,000 students**, the query slows down due to two main database operations:
+
+1. **Full Table Scan (Sequential Scan)**:
+   Without an index containing `studentID`, the database engine must read all **5,000,000 rows** from disk/buffer pool into memory to identify the records matching `studentID = 1042` and `isRead = false`.
+2. **External Sorting (Filesort Overhead)**:
+   The database engine must sort the filtered records by `createdAt ASC`. Since there is no index storing data in this pre-sorted order, the database must perform an in-memory sort. If the matching records exceed the database's sort memory configuration (e.g., `work_mem` in PostgreSQL), the engine writes temporary files to disk to perform a merge sort, causing a huge performance hit.
+
+---
+
+## 3. Recommended Changes and Computation Cost
+
+### 3.1 What to Change
+1. **Create a Composite Index**:
+   Create a multi-column index covering the search filters and the sort column:
+   ```sql
+   CREATE INDEX idx_notifications_student_unread_created 
+   ON notifications (studentID, isRead, createdAt ASC);
+   ```
+2. **Select Only Required Fields**:
+   Avoid `SELECT *` and fetch only necessary fields:
+   ```sql
+   SELECT id, title, message, notificationType, createdAt 
+   FROM notifications
+   WHERE studentID = 1042 AND isRead = false
+   ORDER BY createdAt ASC;
+   ```
+
+### 3.2 Computation Cost Comparison
+* **Before optimization**: 
+  * **Time Complexity**: $O(N)$ where $N = 5,000,000$ (Full Table Scan) + $O(M \log M)$ sorting cost where $M$ is the number of notifications for the student.
+  * **Resource Usage**: High disk I/O to read 5,000,000 rows, high CPU usage for merge sorting.
+* **After optimization**:
+  * **Time Complexity**: $O(\log N + K)$ where $K$ is the number of unread notifications for that student (usually $K < 20$). B-tree index traversal takes logarithmic time.
+  * **Resource Usage**: Instantaneous retrieval requiring reading only a few index pages (typically already cached in memory). Sorting cost becomes $O(1)$ because B-tree index leaf nodes store data pre-sorted.
+
+---
+
+## 4. Evaluation of "Index on Every Column" Strategy
+
+The suggestion to add indexes on every single column **is not effective and is highly discouraged in production systems.**
+
+### Why this strategy fails:
+1. **Write Overhead**: Every write transaction (`INSERT`, `UPDATE`, `DELETE`) must update all corresponding column indexes. Indexing every column slows down data ingestion and status updates.
+2. **Storage and RAM Bloat**: Indexes consume disk space and, more importantly, must reside in RAM for optimal query performance. Indexing every column bloats the index volume, pushing active data out of the RAM buffer cache and slowing down the entire database.
+3. **Inability to Solve Multi-Column Queries**: A query with `WHERE studentID = 1042 AND isRead = false` cannot utilize two separate single-column indexes effectively (index-merge is resource-intensive). It requires a single **Composite Index** on both columns.
+4. **Planner Confusion**: Having too many single-column indexes can cause the query optimizer to miscalculate costs and select sub-optimal execution paths.
+
+---
+
+## 5. Fetching Placement Notifications in the Last 7 Days
+
+To find all unique students who received a `Placement` notification in the last 7 days, use the following optimized query:
+
+### SQL Query
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+*(Note: Use `NOW() - INTERVAL 7 DAY` for MySQL/MariaDB syntax, or standard `CURRENT_DATE - INTERVAL '7 days'` for PostgreSQL)*.
+
+
