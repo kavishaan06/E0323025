@@ -774,3 +774,79 @@ function process_in_app_push_task(task_payload):
         data={"message": message}
     )
 ```
+
+---
+
+# Stage 6: Priority Inbox — Top N Notifications
+
+This section describes the design and implementation of a Priority Inbox that always surfaces the top N most important unread notifications first.
+
+---
+
+## 1. Priority Scoring Algorithm
+
+Priority is computed using a **composite score** that combines notification type weight and recency into a single integer:
+
+```
+Score = (Type Weight × 10,000,000,000,000) + Timestamp_ms
+```
+
+| Type | Weight |
+|:---|:---|
+| Placement | 3 (Highest) |
+| Result | 2 |
+| Event | 1 (Lowest) |
+
+The weight is multiplied by `10^13` (larger than any realistic Unix timestamp in ms), ensuring that **type always dominates**. Within the same type, the **most recent notification wins** because a later timestamp produces a higher score.
+
+---
+
+## 2. Efficient Top-N Maintenance using a Min-Heap
+
+The naïve approach of sorting all notifications every time is $O(M \log M)$ where $M$ is the total number of notifications — expensive when new notifications arrive continuously.
+
+Instead, we use a **Min-Heap of fixed capacity N**:
+- The root of the heap always holds the **lowest-priority item currently in the top N**.
+- For each incoming notification, we compute its score and compare it against the root in $O(1)$.
+- If it beats the root, we replace the root and re-heapify in $O(\log N)$.
+- Result: **$O(M \log N)$ total time** and **$O(N)$ space** — optimal for streaming data.
+
+```
+New notification arrives
+        │
+        ▼
+  Score = weight × 10^13 + timestamp_ms
+        │
+   Heap full?
+  ┌─────┴──────┐
+  No           Yes
+  │             │
+  Push        Score > heap root?
+              ┌────┴────┐
+             No         Yes
+              │          │
+           Discard   Replace root → sinkDown()
+```
+
+---
+
+## 3. Implementation
+
+The full implementation is in [`notification_app_be/priority_inbox.js`](notification_app_be/priority_inbox.js).
+
+**Key design decisions:**
+- Auth token is obtained through the shared `logging_middleware/logger.js` — no hardcoded tokens.
+- `TOP_N` is configurable via a CLI argument (e.g. `node priority_inbox.js 15` for top 15).
+- The heap is a self-contained `MinHeap` class with `push`, `peekMin`, and `toSortedArray` methods.
+
+**Run command:**
+```bash
+node notification_app_be/priority_inbox.js 10
+```
+
+---
+
+## 4. Output Screenshot
+
+![Priority Inbox Output](priority_inbox_output.png)
+
