@@ -296,135 +296,136 @@ data: {"time":"2026-06-10T05:31:00Z"}
 
 ---
 
-# Stage 2: Database Design, Schema, and Queries
+# Stage 2: Database Design, Schema, and Queries (MongoDB)
 
-This section describes the persistent storage strategy, database schema definition, scaling considerations, and implementation queries for the notification platform.
+This section describes the persistent storage strategy using MongoDB, document schema definition, scaling considerations, and implementation queries for the notification platform.
 
 ---
 
 ## 1. Database Selection & Justification
 
-To store notifications reliably under high write volumes and varying query patterns, we recommend **PostgreSQL** (Relational Database) using **JSONB columns for unstructured metadata**.
+To store notifications reliably under high write volumes and varying query patterns, we recommend **MongoDB** (NoSQL Document Database).
 
-### Why PostgreSQL with JSONB is Recommended:
-1. **Hybrid Schema Flexibility (JSONB)**: Notifications often contain dynamic metadata depending on their type (e.g., `jobId` for Placements, `examId` for Results, `venue` for Events). PostgreSQL's `JSONB` data type allows storage of arbitrary schemas while supporting fast, indexable queries (using GIN indexes).
-2. **ACID Compliance and Reliability**: Ensures notifications are never lost, and read status updates are fully consistent.
-3. **Structured Relationships**: Easily enforces foreign key constraints (e.g., ensuring `recipient_id` matches a valid record in the `users` table).
-4. **Rich Partitioning Features**: Built-in declarative partitioning enables seamless scaling as volume grows.
+### Why MongoDB is Recommended:
+1. **Native Dynamic Payload Support**: Notifications are polymorphic (dynamic) by nature. For instance, a `Placement` notification might contain `jobId` and `applyUrl` inside its metadata, whereas a `Result` notification might contain `examId` and `subject`. MongoDB's BSON document structure natively supports dynamic schemas without serialization/deserialization overhead.
+2. **Native Time-to-Live (TTL) Indexes**: Notifications are transient. Rather than implementing database locks or complex range partitions to prune old notifications, MongoDB allows you to create a native TTL index on the `createdAt` field to automatically prune documents older than a specified duration (e.g., 90 days) in the background.
+3. **High Write Throughput**: The WiredTiger storage engine uses document-level concurrency and lock-free algorithms, allowing the system to handle massive write spikes (e.g., sending a notification to all users simultaneously) efficiently.
+4. **Horizontal Scaling via Sharding**: Since notification access patterns are partitioned per user, sharding the database by `recipientId` allows horizontal scalability across multiple machines, keeping active indexes fully resident in memory.
 
 ---
 
-## 2. Database Schema (DDL)
+## 2. Database Schema & Index Design
 
-Below is the DDL schema for PostgreSQL, including optimal indexing strategies for fast retrieval.
+Below is the document schema representation and indexing strategies designed for MongoDB.
 
-```sql
--- Enums for constrained fields
-CREATE TYPE notification_type AS ENUM ('Placement', 'Result', 'Event');
-CREATE TYPE notification_priority AS ENUM ('low', 'medium', 'high');
-CREATE TYPE notification_status AS ENUM ('read', 'unread');
+### 2.1 Sample Document Schema
+```json
+{
+  "_id": { "$oid": "60b8d3f1f1d2a84a6c8b4567" },
+  "recipientId": "usr_94a7e2b1",
+  "title": "Placement Drive: Google APAC 2026",
+  "message": "Applications are now open for the Software Engineer role. Deadline: June 30.",
+  "type": "Placement",
+  "priority": "high",
+  "status": "unread",
+  "metadata": {
+    "jobId": "job_google_001",
+    "applyUrl": "https://careers.google.com"
+  },
+  "createdAt": { "$date": "2026-06-10T05:30:00Z" },
+  "updatedAt": { "$date": "2026-06-10T05:30:00Z" }
+}
+```
 
--- Notifications Table
-CREATE TABLE notifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    recipient_id VARCHAR(64) NOT NULL,
-    title VARCHAR(100) NOT NULL,
-    message TEXT NOT NULL,
-    type notification_type NOT NULL,
-    priority notification_priority NOT NULL DEFAULT 'low',
-    status notification_status NOT NULL DEFAULT 'unread',
-    metadata JSONB DEFAULT '{}'::jsonb,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+### 2.2 Performance Optimization Indexes
+We define compound indexes to optimize user inbox reads and a TTL index to prune old records.
 
--- Performance Optimization Indexes
--- 1. Index for loading a user's unread notifications feed sorted by latest first (Primary query pattern)
-CREATE INDEX idx_notifications_recipient_status_created 
-ON notifications (recipient_id, status, created_at DESC);
+```javascript
+// 1. Compound Index for user inbox queries (fetch user notifications sorted by newest first)
+db.notifications.createIndex({ recipientId: 1, status: 1, createdAt: -1 });
 
--- 2. Index for filtering notifications by category/type
-CREATE INDEX idx_notifications_recipient_type_created 
-ON notifications (recipient_id, type, created_at DESC);
+// 2. Compound Index for user inbox filtered by category/type
+db.notifications.createIndex({ recipientId: 1, type: 1, createdAt: -1 });
 
--- 3. GIN index for deep querying keys inside the dynamic JSONB metadata
-CREATE INDEX idx_notifications_metadata_gin 
-ON notifications USING gin (metadata);
+// 3. TTL Index to automatically delete notification documents after 90 days (7,776,000 seconds)
+db.notifications.createIndex({ "createdAt": 1 }, { expireAfterSeconds: 7776000 });
 ```
 
 ---
 
 ## 3. Scalability Challenges & Solutions
 
-As data volume grows to millions or billions of rows, a standard database design will encounter bottleneck issues.
+As data volume grows to millions of notifications daily, several bottlenecks can arise.
 
 ### 3.1 Anticipated Problems:
-1. **Index Bloat in RAM**: As the table grows, the indices on `recipient_id` and `created_at` will exceed physical memory (RAM). Queries will trigger slow disk I/O instead of hitting RAM cache.
-2. **Slow Table Scans**: Fetching notifications for a specific user requires scanning large B-Tree indices, which slows down as the index depth increases.
-3. **Storage Exhaustion**: Retaining notifications indefinitely will consume massive disk space, most of which belongs to read/old notifications.
-4. **Write Lock Contention**: A high volume of incoming notifications will compete for write locks on the primary database, slowing down message publishing.
+1. **Working Set Exceeds RAM**: Index size grows larger than the available physical RAM. This causes index lookups to fetch pages from disk, leading to severe latency degradation.
+2. **Large collection scans**: If indexes are not utilized properly, fetching user feeds would result in slow scans of millions of documents.
+3. **Write Bottlenecks**: A single primary node will bottleneck under concurrent write loads during mass notifications.
 
 ### 3.2 Mitigation Solutions:
-1. **Horizontal Partitioning (Sharding/Table Partitioning)**: 
-   - **Range Partitioning by Time**: Partition the `notifications` table monthly (e.g., `notifications_2026_06`). Active reads and writes target the current month's partition, keeping the active index size small enough to fit inside RAM.
-   - **Hash Partitioning by Recipient ID**: Partition by `recipient_id` hash, spreading the load across multiple physical tables.
-2. **Data Archiving & Time-to-Live (TTL)**:
-   - Notifications are transient and rarely viewed after 30-90 days. Implement a background worker or cron job to prune or archive notifications older than 90 days into cold storage (e.g., AWS S3, parquet formats) for long-term analytics.
-3. **Caching Read Status (Write-Through/Cache-Aside)**:
-   - Cache the unread notification counts per user in **Redis** (e.g., using a Redis Hash `user:unread_count`).
-   - The frontend reads the badge count directly from Redis. Writes decrement or increment this key in Redis, saving costly database read queries.
+1. **Horizontal Sharding**: Partition the collection across multiple shards. Selecting `recipientId` as the shard key ensures that all read and write queries for a given user map to a single shard, keeping data locally indexed.
+2. **Caching Strategy (Redis)**: Store user unread counts in Redis (e.g., hash keys `user:{id}:unread_count`). When a notification is created, increment the counter. When a notification is read, decrement it. The frontend reads the badge count directly from Redis instead of querying the database.
+3. **Index Optimization**: Use index coverage to prevent loading documents from disk when executing count queries (e.g., retrieving only count of unread notifications using the compound index).
 
 ---
 
 ## 4. REST API Implementation Queries
 
-Below are the optimized SQL queries mapped to each REST API endpoint from Stage 1.
+Below are the MongoDB Shell / Mongoose queries mapped to each REST API endpoint designed in Stage 1.
 
 ### 4.1 Create Notification (`POST /api/v1/notifications`)
-Inserts a new notification record.
-```sql
-INSERT INTO notifications (recipient_id, title, message, type, priority, status, metadata)
-VALUES (
-    'usr_94a7e2b1', 
-    'Placement Drive: Google APAC 2026', 
-    'Applications are now open for the Software Engineer role. Deadline: June 30.', 
-    'Placement', 
-    'high', 
-    'unread', 
-    '{"jobId": "job_google_001", "applyUrl": "https://careers.google.com"}'::jsonb
-)
-RETURNING id, recipient_id, title, message, type, priority, status, metadata, created_at;
+Inserts a new notification document.
+```javascript
+db.notifications.insertOne({
+  recipientId: "usr_94a7e2b1",
+  title: "Placement Drive: Google APAC 2026",
+  message: "Applications are now open for the Software Engineer role. Deadline: June 30.",
+  type: "Placement",
+  priority: "high",
+  status: "unread",
+  metadata: {
+    jobId: "job_google_001",
+    applyUrl: "https://careers.google.com"
+  },
+  createdAt: new Date(),
+  updatedAt: new Date()
+});
 ```
 
-### 4.2 Fetch Notifications with Filters and Cursor Pagination (`GET /api/v1/notifications`)
-Retrieves notifications utilizing pagination and query filters. Uses keyset pagination (cursor) on `created_at` or `id` to prevent slow `OFFSET` page scans.
+### 4.2 Fetch Notifications with Filters and Keyset Pagination (`GET /api/v1/notifications`)
+Retrieves notifications matching filters. Uses keyset pagination (cursor using `createdAt` timestamp) for efficient scanning.
 
-**SQL Query (Example: Fetching latest 10 unread "Placement" notifications for user `usr_94a7e2b1` after cursor timestamp):**
-```sql
-SELECT id, title, message, type, priority, status, metadata, created_at
-FROM notifications
-WHERE recipient_id = 'usr_94a7e2b1'
-  AND type = 'Placement' -- Optional type filter
-  AND status = 'unread'   -- Optional status filter
-  AND created_at < '2026-06-10T05:30:00Z' -- Keyset pagination cursor anchor (timestamp)
-ORDER BY created_at DESC, id DESC
-LIMIT 10;
+**Query (Example: Fetch latest 10 unread "Placement" notifications for user `usr_94a7e2b1` before a specific timestamp cursor):**
+```javascript
+db.notifications.find({
+  recipientId: "usr_94a7e2b1",
+  type: "Placement",                  // Optional filter
+  status: "unread",                    // Optional filter
+  createdAt: { $lt: ISODate("2026-06-10T05:30:00Z") } // Keyset pagination cursor
+})
+.sort({ createdAt: -1 })
+.limit(10);
 ```
 
 ### 4.3 Update Notification Status (`PATCH /api/v1/notifications/:id/status`)
-Updates the read/unread status of a notification for a user.
-```sql
-UPDATE notifications
-SET status = 'read',
-    updated_at = CURRENT_TIMESTAMP
-WHERE id = 'notif_7b8c2d91'
-RETURNING id, status, updated_at;
+Updates the status of a specific notification.
+```javascript
+db.notifications.updateOne(
+  { _id: ObjectId("60b8d3f1f1d2a84a6c8b4567") },
+  { 
+    $set: { 
+      status: "read", 
+      updatedAt: new Date() 
+    } 
+  }
+);
 ```
 
 ### 4.4 Delete Notification (`DELETE /api/v1/notifications/:id`)
-Permanently dismisses a notification.
-```sql
-DELETE FROM notifications
-WHERE id = 'notif_7b8c2d91';
+Permanently deletes a notification.
+```javascript
+db.notifications.deleteOne({
+  _id: ObjectId("60b8d3f1f1d2a84a6c8b4567")
+});
 ```
 
