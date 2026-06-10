@@ -519,4 +519,60 @@ WHERE notificationType = 'Placement'
 ```
 *(Note: Use `NOW() - INTERVAL 7 DAY` for MySQL/MariaDB syntax, or standard `CURRENT_DATE - INTERVAL '7 days'` for PostgreSQL)*.
 
+---
+
+# Stage 4: Database Overload Mitigation & Caching Strategies
+
+Fetching notifications on every single page load for every student creates an $O(N)$ query load relative to user page transitions, leading to DB exhaustion. Below are four concrete strategies to eliminate this performance bottleneck, along with their architecture and trade-offs.
+
+---
+
+## 1. Suggested Strategies to Improve Performance
+
+### Strategy 1: Server-Side Caching (Cache-Aside Pattern with Redis)
+Instead of querying the primary database on every page load, check an in-memory cache (**Redis**) first.
+* **How it works**:
+  * **Read Path**: The API server checks Redis for `user:{studentID}:notifications`. If present (Cache Hit), it returns the data immediately. If missing (Cache Miss), it queries the database, populates Redis with a Time-To-Live (TTL) of e.g. 15 minutes, and returns the response.
+  * **Write/Update Path**: When a new notification is created or updated, invalidate (delete) the user's cache key in Redis so that the subsequent read fetches fresh data from the DB (Write-Through or Cache Invalidation).
+
+### Strategy 2: Pull-to-Push Migration (Stateful Client Connection)
+Shift from a "pull-based" model (restless HTTP GET queries on page load) to a "push-based" model using **Server-Sent Events (SSE)** or **WebSockets**.
+* **How it works**:
+  * The frontend client fetches the active notification list **only once** upon the initial session boot (initial page load).
+  * The client then establishes a persistent, stateful SSE connection (`GET /api/v1/notifications/stream`).
+  * As long as the user navigates the app (Single Page Application routing), the frontend uses the local memory state (e.g., Redux, Vuex, Context). When a new notification is pushed via SSE, the frontend appends it to the in-memory array. The database is never queried again during that session.
+
+### Strategy 3: Client-Side Caching & Stale-While-Revalidate (SWR)
+Use client-side data fetching libraries (like `React Query`, `SWR`, or HTTP `ETags`) to cache responses in the browser.
+* **How it works**:
+  * Utilize the **Stale-While-Revalidate** pattern. When a user navigates to a new page, the client displays the cached notifications instantly (excellent UX) and fires a background fetch to verify updates only if the cache age exceeds a threshold (e.g., 60 seconds).
+  * Set HTTP cache headers: `Cache-Control: private, max-age=60`.
+
+### Strategy 4: Read/Write Split (Database Read Replicas)
+Offload read queries from the primary database to read-only replica instances.
+* **How it works**:
+  * Set up one primary database instance for writes (`INSERT`, `UPDATE`, `DELETE`) and configure two or more read replicas.
+  * Configure the API routing logic to send `POST`, `PATCH`, and `DELETE` requests to the primary DB, and all `GET` notifications requests to the read replica pool.
+
+---
+
+## 2. In-Depth Trade-Off Analysis
+
+| Strategy | Advantages | Disadvantages & Trade-offs |
+|:---|:---|:---|
+| **Redis Caching** (Server-Side) | • Sub-millisecond response times.<br>• Drastically reduces CPU and I/O load on the primary DB.<br>• Highly predictable performance. | • **Cache Invalidation Complexity**: Ensuring the cache is deleted when a user reads a notification is critical. Failures in invalidation lead to stale counts.<br>• **Cost**: RAM is more expensive than SSD storage. |
+| **Real-Time Push** (SSE/WebSockets) | • Zero DB load for notifications on subsequent page views.<br>• Live, instant notifications (superior UX).<br>• No polling intervals needed. | • **Connection Management**: Maintaining 50,000 active TCP connections requires robust load balancers and resource-rich API servers.<br>• **Reconnection Storms**: If the server drops, 50,000 clients attempting to reconnect simultaneously can trigger a DDOS-like spike on the servers. |
+| **Client-Side Caching** (SWR/HTTP) | • Zero server load for repeated views within the TTL.<br>• Trivial to implement; requires no backend infrastructure changes. | • **Delayed Visibility**: Users might experience a delay of up to the TTL (e.g., 60 seconds) in seeing a new notification unless forced refresh is triggered.<br>• **Multi-Tab Sync**: Multiple open tabs might show out-of-sync unread counts. |
+| **Read Replicas** | • Easily scales reads horizontally by adding more replica nodes.<br>• No change to application caching logic needed.<br>• High availability (failover support). | • **Replication Lag**: A notification written to the primary may take a few milliseconds/seconds to sync to the replicas. If a user refreshes immediately, they might not see the new notification (temporary inconsistency). |
+
+---
+
+## 3. Recommended Hybrid Solution
+
+For the best cost-to-performance ratio, we recommend a **hybrid approach**:
+1. **Initial load SWR**: Fetch the notifications list from the backend using client-side **SWR** (caching in-browser for 60 seconds) to prevent routing changes from hitting the backend.
+2. **Server-Side Cache**: Service all API fetches through a **Redis cache** (Cache-Aside pattern) to ensure that when the database is queried, it is fetched from memory.
+3. **Real-time Event updates**: Stream new notifications via **SSE**. When a message is received on the client, update the local memory state and increment the count locally, completely bypassing database reads.
+
+
 
