@@ -293,3 +293,138 @@ data: {"time":"2026-06-10T05:31:00Z"}
 2. **Standard HTTP Compatibility**: SSE operates over standard HTTP/HTTPS protocols, making it transparent to firewalls, API gateways, load balancers, and reverse proxies.
 3. **Automatic Reconnection**: Browsers natively handle connection drops for SSE (`EventSource` API) and auto-reconnect with backoff. With WebSockets, this retry logic must be manually written.
 4. **Multiplexing Support**: Over HTTP/2, SSE connections are multiplexed over a single TCP socket connection, mitigating the 6-connection browser limit per domain.
+
+---
+
+# Stage 2: Database Design, Schema, and Queries
+
+This section describes the persistent storage strategy, database schema definition, scaling considerations, and implementation queries for the notification platform.
+
+---
+
+## 1. Database Selection & Justification
+
+To store notifications reliably under high write volumes and varying query patterns, we recommend **PostgreSQL** (Relational Database) using **JSONB columns for unstructured metadata**.
+
+### Why PostgreSQL with JSONB is Recommended:
+1. **Hybrid Schema Flexibility (JSONB)**: Notifications often contain dynamic metadata depending on their type (e.g., `jobId` for Placements, `examId` for Results, `venue` for Events). PostgreSQL's `JSONB` data type allows storage of arbitrary schemas while supporting fast, indexable queries (using GIN indexes).
+2. **ACID Compliance and Reliability**: Ensures notifications are never lost, and read status updates are fully consistent.
+3. **Structured Relationships**: Easily enforces foreign key constraints (e.g., ensuring `recipient_id` matches a valid record in the `users` table).
+4. **Rich Partitioning Features**: Built-in declarative partitioning enables seamless scaling as volume grows.
+
+---
+
+## 2. Database Schema (DDL)
+
+Below is the DDL schema for PostgreSQL, including optimal indexing strategies for fast retrieval.
+
+```sql
+-- Enums for constrained fields
+CREATE TYPE notification_type AS ENUM ('Placement', 'Result', 'Event');
+CREATE TYPE notification_priority AS ENUM ('low', 'medium', 'high');
+CREATE TYPE notification_status AS ENUM ('read', 'unread');
+
+-- Notifications Table
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    recipient_id VARCHAR(64) NOT NULL,
+    title VARCHAR(100) NOT NULL,
+    message TEXT NOT NULL,
+    type notification_type NOT NULL,
+    priority notification_priority NOT NULL DEFAULT 'low',
+    status notification_status NOT NULL DEFAULT 'unread',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Performance Optimization Indexes
+-- 1. Index for loading a user's unread notifications feed sorted by latest first (Primary query pattern)
+CREATE INDEX idx_notifications_recipient_status_created 
+ON notifications (recipient_id, status, created_at DESC);
+
+-- 2. Index for filtering notifications by category/type
+CREATE INDEX idx_notifications_recipient_type_created 
+ON notifications (recipient_id, type, created_at DESC);
+
+-- 3. GIN index for deep querying keys inside the dynamic JSONB metadata
+CREATE INDEX idx_notifications_metadata_gin 
+ON notifications USING gin (metadata);
+```
+
+---
+
+## 3. Scalability Challenges & Solutions
+
+As data volume grows to millions or billions of rows, a standard database design will encounter bottleneck issues.
+
+### 3.1 Anticipated Problems:
+1. **Index Bloat in RAM**: As the table grows, the indices on `recipient_id` and `created_at` will exceed physical memory (RAM). Queries will trigger slow disk I/O instead of hitting RAM cache.
+2. **Slow Table Scans**: Fetching notifications for a specific user requires scanning large B-Tree indices, which slows down as the index depth increases.
+3. **Storage Exhaustion**: Retaining notifications indefinitely will consume massive disk space, most of which belongs to read/old notifications.
+4. **Write Lock Contention**: A high volume of incoming notifications will compete for write locks on the primary database, slowing down message publishing.
+
+### 3.2 Mitigation Solutions:
+1. **Horizontal Partitioning (Sharding/Table Partitioning)**: 
+   - **Range Partitioning by Time**: Partition the `notifications` table monthly (e.g., `notifications_2026_06`). Active reads and writes target the current month's partition, keeping the active index size small enough to fit inside RAM.
+   - **Hash Partitioning by Recipient ID**: Partition by `recipient_id` hash, spreading the load across multiple physical tables.
+2. **Data Archiving & Time-to-Live (TTL)**:
+   - Notifications are transient and rarely viewed after 30-90 days. Implement a background worker or cron job to prune or archive notifications older than 90 days into cold storage (e.g., AWS S3, parquet formats) for long-term analytics.
+3. **Caching Read Status (Write-Through/Cache-Aside)**:
+   - Cache the unread notification counts per user in **Redis** (e.g., using a Redis Hash `user:unread_count`).
+   - The frontend reads the badge count directly from Redis. Writes decrement or increment this key in Redis, saving costly database read queries.
+
+---
+
+## 4. REST API Implementation Queries
+
+Below are the optimized SQL queries mapped to each REST API endpoint from Stage 1.
+
+### 4.1 Create Notification (`POST /api/v1/notifications`)
+Inserts a new notification record.
+```sql
+INSERT INTO notifications (recipient_id, title, message, type, priority, status, metadata)
+VALUES (
+    'usr_94a7e2b1', 
+    'Placement Drive: Google APAC 2026', 
+    'Applications are now open for the Software Engineer role. Deadline: June 30.', 
+    'Placement', 
+    'high', 
+    'unread', 
+    '{"jobId": "job_google_001", "applyUrl": "https://careers.google.com"}'::jsonb
+)
+RETURNING id, recipient_id, title, message, type, priority, status, metadata, created_at;
+```
+
+### 4.2 Fetch Notifications with Filters and Cursor Pagination (`GET /api/v1/notifications`)
+Retrieves notifications utilizing pagination and query filters. Uses keyset pagination (cursor) on `created_at` or `id` to prevent slow `OFFSET` page scans.
+
+**SQL Query (Example: Fetching latest 10 unread "Placement" notifications for user `usr_94a7e2b1` after cursor timestamp):**
+```sql
+SELECT id, title, message, type, priority, status, metadata, created_at
+FROM notifications
+WHERE recipient_id = 'usr_94a7e2b1'
+  AND type = 'Placement' -- Optional type filter
+  AND status = 'unread'   -- Optional status filter
+  AND created_at < '2026-06-10T05:30:00Z' -- Keyset pagination cursor anchor (timestamp)
+ORDER BY created_at DESC, id DESC
+LIMIT 10;
+```
+
+### 4.3 Update Notification Status (`PATCH /api/v1/notifications/:id/status`)
+Updates the read/unread status of a notification for a user.
+```sql
+UPDATE notifications
+SET status = 'read',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = 'notif_7b8c2d91'
+RETURNING id, status, updated_at;
+```
+
+### 4.4 Delete Notification (`DELETE /api/v1/notifications/:id`)
+Permanently dismisses a notification.
+```sql
+DELETE FROM notifications
+WHERE id = 'notif_7b8c2d91';
+```
+
