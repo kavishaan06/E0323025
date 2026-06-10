@@ -574,5 +574,203 @@ For the best cost-to-performance ratio, we recommend a **hybrid approach**:
 2. **Server-Side Cache**: Service all API fetches through a **Redis cache** (Cache-Aside pattern) to ensure that when the database is queried, it is fetched from memory.
 3. **Real-time Event updates**: Stream new notifications via **SSE**. When a message is received on the client, update the local memory state and increment the count locally, completely bypassing database reads.
 
+---
 
+# Stage 5: Reliable High-Volume Messaging & Asynchronous Architecture
 
+This section reviews the synchronous "Notify All" implementation for 50,000 users, analyzes the partial email delivery failure, decouples database transactions from third-party APIs, and details an asynchronous system design.
+
+---
+
+## 1. Analysis of Current Shortcomings
+
+The proposed implementation runs a synchronous loop over 50,000 students:
+```python
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+### 1.1 Shortcomings Identified:
+1. **Request Timeout / Thread Blocking**: 
+   Sending an email via an external API takes roughly 100ms–300ms. If processing each student takes 200ms, notifying 50,000 students takes $50,000 \times 200\text{ms} = 10,000\text{ seconds}$ (~2.7 hours). The web server handling the request will long timeout, and the HTTP request thread will block, leading to server exhaustion.
+2. **Lack of Fault Isolation**:
+   If `send_email` throws an exception for student #10,000 (e.g. invalid email format), the entire function crashes. Students #10,001 to #50,000 will never receive their notifications.
+3. **No Transaction Tracking or Idempotency**:
+   If the script crashes midway, there is no state indicating who received the notification. Rerunning the script will duplicate emails/notifications for the users who successfully completed before the crash.
+4. **Third-Party Rate Limits**:
+   Making 50,000 sequential HTTP requests to an email provider (like SendGrid or AWS SES) will trigger rate limits (HTTP 429), leading to mass failures.
+5. **Database Connection Pool Exhaustion**:
+   Opening and closing 50,000 individual insert queries sequentially is highly inefficient and creates long-running transaction locks.
+
+---
+
+## 2. Handling the 200 Failed Emails Midway
+
+In the original implementation, when `send_email` fails for 200 students midway, the system crashes or leaves these 200 users in an inconsistent state (they might have received the in-app push but not the email). 
+
+### How to resolve this in a production system:
+1. **Decoupled Job State**: Track each recipient's delivery status (`pending`, `sent`, `failed`) in a batch table.
+2. **Individual Task Queues**: Run email delivery as independent async tasks. A failure in one task does not affect other tasks.
+3. **Dead Letter Queue (DLQ)**: If an email fails repeatedly, move it to a DLQ for manual analysis (e.g., checking for invalid addresses), without halting the system.
+
+---
+
+## 3. Decoupling Database Inserts and Email Sending
+
+### Should database saves and email delivery happen together synchronously?
+**No, they must be completely decoupled.**
+
+* **Why?**
+  * **System Latency Differences**: A database write is local and takes $<2\text{ms}$. An email call goes over the public internet to a third-party server, taking $>200\text{ms}$. Grouping them together forces the fast database write to wait for the slow network request.
+  * **Reliability Isolation**: Email delivery is highly volatile (prone to SMTP failures, spam filters, vendor downtime). Database storage is highly reliable. If they are tied together, a failure in the email API rolls back or crashes the database transaction, preventing the student from receiving even the in-app notification.
+  * **Asynchronous Execution**: The database record should serve as the "Source of Truth". Once saved to the DB, the system can spin up background workers to handle email delivery in parallel, consuming from a queue at its own pace.
+
+---
+
+## 4. Redesigned Asynchronous Architecture
+
+The system is redesigned to use **Message Queues (e.g. RabbitMQ, Redis BullMQ, or Kafka)** to process writes, emails, and pushes asynchronously.
+
+```mermaid
+sequenceDiagram
+    participant HR as HR Portal
+    participant API as API Server
+    participant DB as Database
+    participant MQ as Message Queue
+    participant W as Worker Pool
+
+    HR->>API: POST /api/v1/notifications/notify-all (50k IDs)
+    Note over API: Generate Batch ID
+    API->>DB: Create Batch record (Status: Processing)
+    API->>MQ: Publish "broadcast-job" task
+    API-->>HR: HTTP 202 Accepted (batch_id: "batch_abc123")
+    
+    Note over MQ, W: Workers pick up broadcast-job
+    W->>DB: Bulk insert 50,000 notifications (in chunks of 1000)
+    W->>MQ: Fan-out 50k individual "send-email-tasks" & "push-app-tasks"
+    
+    par Email Workers
+        W->>MQ: Consume "send-email-task"
+        W->>SMTP: Send email (External API)
+        Note over W: Retries with exponential backoff on failure
+    and Push Workers
+        W->>MQ: Consume "push-app-task"
+        W->>SSE: Push live event to active browser connections
+    end
+```
+
+---
+
+## 5. Revised Asynchronous Pseudocode
+
+### 5.1 API Endpoint Handler (Immediate Response)
+```python
+# Triggered when HR clicks "Notify All"
+function notify_all_api_handler(student_ids: array, message: string):
+    batch_id = generate_uuid()
+    
+    # 1. Create a metadata record to track the broadcast status
+    db.create_batch_record(batch_id, status="Processing", total_recipient_count=len(student_ids))
+    
+    # 2. Enqueue the heavy lifting to the message broker
+    MessageQueue.publish("broadcast-job-queue", {
+        "batch_id": batch_id,
+        "student_ids": student_ids,
+        "message": message
+    })
+    
+    # 3. Return immediately to prevent browser timeout
+    return HTTP_Response(
+        status=202, 
+        body={
+            "success": true, 
+            "batch_id": batch_id, 
+            "message": "Broadcast queued successfully."
+        }
+    )
+```
+
+### 5.2 Background Broadcast Worker
+```python
+# Processes the "broadcast-job-queue" in the background
+function process_broadcast_job(job_payload):
+    batch_id = job_payload.batch_id
+    student_ids = job_payload.student_ids
+    message = job_payload.message
+    
+    # 1. Perform bulk inserts to avoid 50k roundtrips
+    # Inserting in chunks of 1,000 records
+    chunk_size = 1000
+    for chunk in get_chunks(student_ids, chunk_size):
+        db.bulk_insert_notifications(
+            recipient_ids=chunk, 
+            title="Broadcast Alert", 
+            message=message, 
+            status="unread"
+        )
+        
+    # 2. Fan-out individual async tasks for emails and in-app pushes
+    for student_id in student_ids:
+        MessageQueue.publish("email-delivery-queue", {
+            "student_id": student_id,
+            "message": message,
+            "retry_count": 0
+        })
+        MessageQueue.publish("in-app-push-queue", {
+            "student_id": student_id,
+            "message": message
+        })
+        
+    db.update_batch_status(batch_id, status="Completed")
+```
+
+### 5.3 Email Delivery Worker (with Retry & Backoff)
+```python
+# Processes "email-delivery-queue" tasks concurrently
+function process_email_task(task_payload):
+    student_id = task_payload.student_id
+    message = task_payload.message
+    retry_count = task_payload.retry_count
+    
+    try:
+        # Fetch email address from cached database session
+        email_address = db.get_student_email(student_id)
+        
+        # Invoke external Email Provider
+        EmailProvider.send(email_address, message)
+        
+    except TemporaryAPIError as error:
+        if retry_count < MAX_RETRIES:
+            # Requeue with backoff delay (e.g. retry #1 = 10s, #2 = 20s, #3 = 40s)
+            backoff_delay = pow(2, retry_count) * 10 
+            MessageQueue.publish_delayed("email-delivery-queue", {
+                "student_id": student_id,
+                "message": message,
+                "retry_count": retry_count + 1
+            }, delay_seconds=backoff_delay)
+        else:
+            # Send to Dead Letter Queue (DLQ) after repeated failures
+            MessageQueue.publish("email-delivery-dlq", {
+                "student_id": student_id,
+                "message": message,
+                "error_message": str(error)
+            })
+```
+
+### 5.4 In-App Push Worker
+```python
+# Processes "in-app-push-queue" tasks
+function process_in_app_push_task(task_payload):
+    student_id = task_payload.student_id
+    message = task_payload.message
+    
+    # Broadcast to user's active socket or SSE stream connection
+    PushServer.send_to_active_connection(
+        target_user=student_id, 
+        event_name="new_notification", 
+        data={"message": message}
+    )
+```
