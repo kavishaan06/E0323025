@@ -850,3 +850,83 @@ node notification_app_be/priority_inbox.js 10
 
 ![Priority Inbox Output](priority_inbox_output.png)
 
+---
+
+# Stage 7: React Frontend — Notification Centre
+
+## Overview
+
+A responsive **React + Vite** single-page application running on `http://localhost:3000` that provides two pages:
+
+| Page | Route | Purpose |
+|:---|:---|:---|
+| All Notifications | `/` | Full paginated feed with type filter and read tracking |
+| Priority Inbox | `/priority` | Top-N ranked notifications with adjustable slider |
+
+**Stack:** React 18, React Router v6, Material UI v6, Axios, Vite 5
+
+---
+
+## Architecture
+
+```
+notification_app_fe/
+├── src/
+│   ├── api/
+│   │   └── notificationsApi.js   ← Auth + fetch + MinHeap scoring
+│   ├── components/
+│   │   ├── Layout.jsx            ← Sticky AppBar + mobile drawer
+│   │   ├── NotificationCard.jsx  ← Card with read/unread + rank badge
+│   │   └── TypeChip.jsx          ← Colour-coded type badges
+│   ├── hooks/
+│   │   └── useReadTracker.js     ← localStorage read-state persistence
+│   ├── pages/
+│   │   ├── AllNotifications.jsx  ← Paginated list + filter + mark-read
+│   │   └── PriorityInbox.jsx     ← Min-Heap top-N + slider + legend
+│   ├── App.jsx
+│   └── main.jsx
+├── vite.config.js                ← Port 3000 + /api proxy (no CORS)
+└── package.json
+```
+
+**Key Design Decisions:**
+- API calls go through the **Vite proxy** (`/api` → `http://4.224.186.213/evaluation-service`) to avoid browser CORS restrictions — no extension needed.
+- **Read/unread state** is persisted in `localStorage` using a `Set<ID>` — survives page refresh.
+- **Priority scoring** in the frontend mirrors `priority_inbox.js` exactly: `Score = (weight × 10¹³) + timestamp_ms` using a `MinHeap<N>`.
+- The **Top-N slider** (5–25, step 5) triggers a re-fetch + re-rank on change.
+- **Type filter** uses MUI `ToggleButtonGroup` and passes `notification_type` as a query param to the API.
+
+---
+
+## Screenshots
+
+### Desktop — All Notifications
+![Desktop All Notifications](notification_app_fe/screenshots/desktop_all_notifications.png)
+
+### Desktop — Placement Filter Active
+![Desktop Placement Filter](notification_app_fe/screenshots/desktop_placement_filter.png)
+
+### Desktop — Read/Unread State
+![Desktop Read State](notification_app_fe/screenshots/desktop_read_state.png)
+
+### Desktop — Priority Inbox
+![Desktop Priority Inbox](notification_app_fe/screenshots/desktop_priority_inbox.png)
+
+### Mobile — All Notifications
+![Mobile All Notifications](notification_app_fe/screenshots/mobile_all_notifications.png)
+
+### Mobile — Navigation Drawer
+![Mobile Drawer Open](notification_app_fe/screenshots/mobile_drawer_open.png)
+
+### Mobile — Priority Inbox
+![Mobile Priority Inbox](notification_app_fe/screenshots/mobile_priority_inbox.png)
+
+---
+
+## Running the App
+
+```bash
+cd notification_app_fe
+npm install
+npm run dev        # starts at http://localhost:3000
+```
